@@ -18,6 +18,10 @@ first date the symbol appears in F&O:
                            ( (1/n) * sum(|spread_i - mean_spread|) )
     * max_abs_spread    -> largest spread in absolute terms
 
+Only symbols that are CURRENTLY in the NSE F&O list are analysed. The current
+list is fetched from NSE's market-lots file; if NSE is unreachable it falls
+back to the symbols present on the most recent trading date already in the DB.
+
 Results are written back to the local MongoDB:
     * <db>.spread_daily    -> one document per (symbol, trading_date)
     * <db>.spread_summary  -> one document per symbol with the statistics
@@ -27,10 +31,28 @@ fast even on ~1M documents.
 """
 
 import argparse
+import csv
+import io
 import os
 from datetime import datetime, timedelta
+from urllib.request import Request, urlopen
 
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
+
+# NSE publishes the current F&O market lots (and therefore the current F&O
+# universe) in this CSV. The "Derivatives on Individual Securities" section
+# lists every stock currently in F&O.
+NSE_MKTLOTS_URLS = [
+    "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv",
+    "https://www1.nseindia.com/content/fo/fo_mktlots.csv",
+]
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,application/csv,text/plain,*/*",
+}
 
 
 def years_ago(n_years: int) -> datetime:
@@ -38,15 +60,102 @@ def years_ago(n_years: int) -> datetime:
     return datetime.utcnow() - timedelta(days=int(round(365.25 * n_years)))
 
 
-def build_daily_pipeline(cutoff: datetime, instrument: str, daily_coll: str):
+def parse_fno_symbols_csv(text: str) -> set:
+    """
+    Parse NSE's market-lots CSV and return the set of stock symbols that are
+    currently in F&O (the "Derivatives on Individual Securities" section only,
+    so indices like NIFTY/BANKNIFTY are excluded).
+    """
+    symbols = set()
+    in_stock_section = False
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        if not row:
+            continue
+        first = row[0].strip().upper()
+        # The stock section begins after this marker row.
+        if first.startswith("DERIVATIVES ON INDIVIDUAL"):
+            in_stock_section = True
+            continue
+        if not in_stock_section:
+            continue
+        if len(row) < 2:
+            continue
+        symbol = row[1].strip().upper()
+        # Skip the header ("Symbol") and any blank entries.
+        if symbol and symbol != "SYMBOL":
+            symbols.add(symbol)
+    return symbols
+
+
+def fetch_fno_symbols_from_nse() -> set:
+    """Download and parse the current F&O stock universe from NSE."""
+    last_err = None
+    for url in NSE_MKTLOTS_URLS:
+        try:
+            req = Request(url, headers=NSE_HEADERS)
+            with urlopen(req, timeout=30) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            symbols = parse_fno_symbols_csv(text)
+            if symbols:
+                return symbols
+        except Exception as exc:  # noqa: BLE001 - fall back to next url / DB
+            last_err = exc
+    raise RuntimeError(f"Could not fetch F&O list from NSE: {last_err}")
+
+
+def fetch_fno_symbols_from_db(db, source: str, instrument: str) -> set:
+    """
+    Fallback: derive the "currently in F&O" universe from the data itself --
+    every symbol that traded on the most recent trading date in the collection.
+    """
+    latest = list(
+        db[source]
+        .find({"instrument": instrument}, {"trading_date": 1})
+        .sort("trading_date", DESCENDING)
+        .limit(1)
+    )
+    if not latest:
+        return set()
+    latest_date = latest[0]["trading_date"]
+    symbols = db[source].distinct(
+        "symbol", {"instrument": instrument, "trading_date": latest_date}
+    )
+    return {s.strip().upper() for s in symbols if s}
+
+
+def resolve_fno_symbols(db, source: str, instrument: str, fno_source: str) -> set:
+    """Get the current F&O symbol universe according to the chosen strategy."""
+    if fno_source in ("nse", "auto"):
+        try:
+            symbols = fetch_fno_symbols_from_nse()
+            print(f"      fetched {len(symbols)} F&O symbols from NSE.")
+            return symbols
+        except Exception as exc:  # noqa: BLE001
+            if fno_source == "nse":
+                raise
+            print(f"      NSE fetch failed ({exc}); falling back to DB latest date.")
+    symbols = fetch_fno_symbols_from_db(db, source, instrument)
+    print(f"      derived {len(symbols)} F&O symbols from DB's latest trading date.")
+    return symbols
+
+
+def build_daily_pipeline(cutoff: datetime, instrument: str, daily_coll: str, symbols):
     """
     Aggregation that produces one document per (symbol, trading_date) with the
     near/mid month contracts and the close-price calendar spread, written to
     `daily_coll` via $out.
     """
     return [
-        # 1. Only stock futures within the requested time window.
-        {"$match": {"instrument": instrument, "trading_date": {"$gte": cutoff}}},
+        # 1. Only stock futures, within the time window, and only symbols that
+        #    are currently in the F&O list.
+        {
+            "$match": {
+                "instrument": instrument,
+                "trading_date": {"$gte": cutoff},
+                "symbol": {"$in": sorted(symbols)},
+            }
+        },
 
         # 2. Sort so expiries are ascending within each (symbol, trading_date).
         {"$sort": {"symbol": ASCENDING, "trading_date": ASCENDING, "expiry": ASCENDING}},
@@ -199,6 +308,16 @@ def main():
         action="store_true",
         help="Ignore the --years window and use every available date.",
     )
+    parser.add_argument(
+        "--fno-source",
+        choices=["auto", "nse", "db"],
+        default="auto",
+        help=(
+            "How to determine the current F&O universe: 'nse' (fetch from NSE), "
+            "'db' (symbols on the latest trading date in the DB), or 'auto' "
+            "(NSE with DB fallback). Default: auto."
+        ),
+    )
     args = parser.parse_args()
 
     cutoff = datetime(1970, 1, 1) if args.all_history else years_ago(args.years)
@@ -211,10 +330,27 @@ def main():
     print(f"Source: {args.source} | instrument: {args.instrument} | window: {window}")
     print("Spread definition: close(mid_month) - close(current_month)\n")
 
+    # --- Stage 0: resolve the CURRENT F&O universe ------------------------
+    print(f"[0/4] Resolving current F&O symbols (source: {args.fno_source}) ...")
+    fno_symbols = resolve_fno_symbols(db, args.source, args.instrument, args.fno_source)
+    if not fno_symbols:
+        raise SystemExit(
+            "No current F&O symbols could be determined. "
+            "Try --fno-source db, or check connectivity to NSE."
+        )
+    # Keep only symbols that actually exist in the source collection.
+    present = set(db[args.source].distinct("symbol", {"instrument": args.instrument}))
+    present_upper = {s.strip().upper(): s for s in present if s}
+    matched = {present_upper[s] for s in fno_symbols if s in present_upper}
+    print(
+        f"      {len(matched)} of {len(fno_symbols)} F&O symbols found in "
+        f"{args.source} and will be analysed.\n"
+    )
+
     # --- Stage 1: daily spread series -------------------------------------
-    print(f"[1/3] Building daily spreads -> {args.db}.{args.daily_collection} ...")
+    print(f"[1/4] Building daily spreads -> {args.db}.{args.daily_collection} ...")
     db[args.source].aggregate(
-        build_daily_pipeline(cutoff, args.instrument, args.daily_collection),
+        build_daily_pipeline(cutoff, args.instrument, args.daily_collection, matched),
         allowDiskUse=True,
     )
     daily_count = db[args.daily_collection].count_documents({})
@@ -224,7 +360,7 @@ def main():
     db[args.daily_collection].create_index([("symbol", ASCENDING), ("trading_date", ASCENDING)])
 
     # --- Stage 2: per-symbol summary --------------------------------------
-    print(f"[2/3] Building per-symbol summary -> {args.db}.{args.summary_collection} ...")
+    print(f"[2/4] Building per-symbol summary -> {args.db}.{args.summary_collection} ...")
     db[args.daily_collection].aggregate(
         build_summary_pipeline(args.summary_collection),
         allowDiskUse=True,
@@ -234,7 +370,7 @@ def main():
     print(f"      done: {symbol_count:,} symbols summarised.")
 
     # --- Stage 3: preview --------------------------------------------------
-    print("\n[3/3] Sample summary (top 10 by max_abs_spread):")
+    print("\n[3/4] Sample summary (top 10 by max_abs_spread):")
     header = f"{'SYMBOL':<14}{'OBS':>6}{'MEAN':>12}{'MAX':>12}{'MIN':>12}{'MEAN_DEV':>12}"
     print(header)
     print("-" * len(header))
