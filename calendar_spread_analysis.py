@@ -11,9 +11,10 @@ contracts, picks the two nearest expiries -- the "current month" (near) and the
 It then aggregates, per symbol, over the past N years (default 7) or from the
 first date the symbol appears in F&O:
 
+    * mean_spread       -> average spread
+    * std_dev_spread    -> population standard deviation of the spread
     * max_spread        -> largest spread observed
     * min_spread        -> smallest (most negative) spread observed
-    * mean_spread       -> average spread
     * mean_deviation    -> mean absolute deviation from the mean spread
                            ( (1/n) * sum(|spread_i - mean_spread|) )
     * max_abs_spread    -> largest spread in absolute terms
@@ -216,9 +217,12 @@ def build_daily_pipeline(cutoff: datetime, instrument: str, daily_coll: str, sym
 
 def build_summary_pipeline(summary_coll: str, gap_threshold_days: int):
     """
-    Aggregation over the daily spread collection to produce per-symbol stats,
-    including the mean deviation and GAP DETECTION, written to `summary_coll`
-    via $out.
+    Aggregation over the daily spread collection to produce a normalised,
+    per-symbol summary written to `summary_coll` via $out.
+
+    Spread is always mid_month_close - current_month_close. Per symbol it
+    computes mean_spread, std_dev_spread (population standard deviation),
+    max_spread, min_spread, plus mean_deviation and GAP DETECTION.
 
     Gap detection surfaces stocks that were in F&O, dropped out, and later
     rejoined: the daily series has no documents while the stock is out of F&O,
@@ -236,6 +240,7 @@ def build_summary_pipeline(summary_coll: str, gap_threshold_days: int):
                 "spreads": {"$push": "$spread"},
                 "dates": {"$push": "$trading_date"},
                 "mean_spread": {"$avg": "$spread"},
+                "std_dev_spread": {"$stdDevPop": "$spread"},
                 "max_spread": {"$max": "$spread"},
                 "min_spread": {"$min": "$spread"},
                 "observations": {"$sum": 1},
@@ -349,17 +354,26 @@ def build_summary_pipeline(summary_coll: str, gap_threshold_days: int):
         {
             "$project": {
                 "_id": 0,
+                # --- identity ---
                 "symbol": "$_id",
+                "instrument": {"$literal": "FUTSTK"},
+                "spread_definition": {
+                    "$literal": "mid_month_close - current_month_close"
+                },
+                # --- coverage ---
                 "observations": 1,
                 "first_date": 1,
                 "last_date": 1,
                 "calendar_days_span": 1,
+                # --- core spread statistics (mid - current month) ---
                 "mean_spread": {"$round": ["$mean_spread", 4]},
+                "std_dev_spread": {"$round": ["$std_dev_spread", 4]},
                 "max_spread": {"$round": ["$max_spread", 4]},
                 "min_spread": {"$round": ["$min_spread", 4]},
-                "max_abs_spread": {"$round": ["$max_abs_spread", 4]},
+                # --- extra dispersion measures ---
                 "mean_deviation": {"$round": ["$mean_deviation", 4]},
-                # Gap-detection fields.
+                "max_abs_spread": {"$round": ["$max_abs_spread", 4]},
+                # --- gap detection (left & rejoined F&O) ---
                 "has_gap": 1,
                 "gap_count": 1,
                 "largest_gap_days": 1,
@@ -550,10 +564,10 @@ def main():
         )
 
     # --- Stage 3: preview --------------------------------------------------
-    print("\n[3/4] Sample summary (top 10 by max_abs_spread):")
+    print("\n[3/4] Sample summary (top 10 by max_abs_spread) | spread = mid - current month:")
     header = (
-        f"{'SYMBOL':<14}{'OBS':>6}{'AVAIL_FROM':>13}{'MEAN':>10}"
-        f"{'MAX':>10}{'MIN':>10}{'MEAN_DEV':>10}"
+        f"{'SYMBOL':<12}{'OBS':>6}{'AVAIL_FROM':>12}{'MEAN':>10}"
+        f"{'STD_DEV':>10}{'MAX':>10}{'MIN':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -568,13 +582,13 @@ def main():
         .limit(10)
     ):
         print(
-            f"{doc['symbol']:<14}"
+            f"{doc['symbol']:<12}"
             f"{doc['observations']:>6}"
-            f"{_d(doc.get('data_available_from')):>13}"
+            f"{_d(doc.get('data_available_from')):>12}"
             f"{doc['mean_spread']:>10.2f}"
+            f"{doc['std_dev_spread']:>10.2f}"
             f"{doc['max_spread']:>10.2f}"
             f"{doc['min_spread']:>10.2f}"
-            f"{doc['mean_deviation']:>10.2f}"
         )
 
     # --- Stage 4: gap report ----------------------------------------------
