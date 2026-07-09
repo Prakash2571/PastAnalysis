@@ -38,7 +38,7 @@ import os
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, UpdateOne
 
 # NSE publishes the current F&O market lots (and therefore the current F&O
 # universe) in this CSV. The "Derivatives on Individual Securities" section
@@ -507,11 +507,66 @@ def main():
     symbol_count = db[args.summary_collection].count_documents({})
     print(f"      done: {symbol_count:,} symbols summarised.")
 
+    # Enrich each summary with the TRUE earliest date the symbol's futures data
+    # is available (ignoring the analysis window), so you can see exactly "from
+    # where" each stock's history begins -- and whether the 7-year cap is
+    # truncating older data that exists.
+    print("      annotating each symbol with its data-availability start ...")
+    avail = db[args.source].aggregate(
+        [
+            {"$match": {"instrument": args.instrument, "symbol": {"$in": sorted(matched)}}},
+            {
+                "$group": {
+                    "_id": "$symbol",
+                    "data_available_from": {"$min": "$trading_date"},
+                    "data_available_to": {"$max": "$trading_date"},
+                }
+            },
+        ],
+        allowDiskUse=True,
+    )
+    ops = []
+    for a in avail:
+        available_from = a["data_available_from"]
+        ops.append(
+            UpdateOne(
+                {"symbol": a["_id"]},
+                {
+                    "$set": {
+                        "data_available_from": available_from,
+                        "data_available_to": a["data_available_to"],
+                        # True if older-than-window data exists that was excluded.
+                        "history_truncated_by_window": (
+                            not args.all_history and available_from < cutoff
+                        ),
+                    }
+                },
+            )
+        )
+    if ops:
+        db[args.summary_collection].bulk_write(ops)
+    truncated = db[args.summary_collection].count_documents(
+        {"history_truncated_by_window": True}
+    )
+    if truncated:
+        print(
+            f"      note: {truncated} symbols have futures data older than the "
+            f"{args.years}-year window (analysed from {cutoff.date()}). "
+            "Use --all-history to include everything."
+        )
+
     # --- Stage 3: preview --------------------------------------------------
     print("\n[3/4] Sample summary (top 10 by max_abs_spread):")
-    header = f"{'SYMBOL':<14}{'OBS':>6}{'MEAN':>12}{'MAX':>12}{'MIN':>12}{'MEAN_DEV':>12}"
+    header = (
+        f"{'SYMBOL':<14}{'OBS':>6}{'AVAIL_FROM':>13}{'MEAN':>10}"
+        f"{'MAX':>10}{'MIN':>10}{'MEAN_DEV':>10}"
+    )
     print(header)
     print("-" * len(header))
+
+    def _d(val):
+        return val.date().isoformat() if hasattr(val, "date") else str(val)
+
     for doc in (
         db[args.summary_collection]
         .find({}, {"_id": 0})
@@ -521,10 +576,11 @@ def main():
         print(
             f"{doc['symbol']:<14}"
             f"{doc['observations']:>6}"
-            f"{doc['mean_spread']:>12.2f}"
-            f"{doc['max_spread']:>12.2f}"
-            f"{doc['min_spread']:>12.2f}"
-            f"{doc['mean_deviation']:>12.2f}"
+            f"{_d(doc.get('data_available_from')):>13}"
+            f"{doc['mean_spread']:>10.2f}"
+            f"{doc['max_spread']:>10.2f}"
+            f"{doc['min_spread']:>10.2f}"
+            f"{doc['mean_deviation']:>10.2f}"
         )
 
     # --- Stage 4: gap report ----------------------------------------------
