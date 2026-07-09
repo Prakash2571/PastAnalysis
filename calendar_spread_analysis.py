@@ -32,7 +32,6 @@ fast even on ~1M documents.
 
 import argparse
 import csv
-import difflib
 import io
 import os
 from datetime import datetime, timedelta
@@ -460,29 +459,24 @@ def main():
         f"{args.source} and will be analysed."
     )
 
-    # Diagnostic: report the F&O symbols that are NOT in the data, and try to
-    # guess likely renames by fuzzy-matching against symbols that ARE present.
+    # Diagnostic: plainly list the current F&O symbols that are NOT present in
+    # the data (no name guessing / no rename assumptions). Persist the full
+    # list so it can be reviewed in MongoDB.
+    db["spread_unmatched_fno"].drop()
     if missing:
-        present_keys = list(present_upper.keys())
-        unmatched_docs = []
         print(
-            f"      {len(missing)} current F&O symbols are NOT in {args.source} "
-            f"(so they can't be analysed):"
+            f"      {len(missing)} current F&O symbols are NOT available in "
+            f"{args.source} (so they can't be analysed):"
         )
-        for sym in missing:
-            suggestions = difflib.get_close_matches(sym, present_keys, n=3, cutoff=0.6)
-            hint = f"  ->  possible match in data: {', '.join(suggestions)}" if suggestions else ""
-            print(f"        - {sym}{hint}")
-            unmatched_docs.append(
-                {"symbol": sym, "reason": "not_in_source", "possible_matches": suggestions}
-            )
-        # Persist for later inspection.
-        db["spread_unmatched_fno"].drop()
-        db["spread_unmatched_fno"].insert_many(unmatched_docs)
-        print(
-            f"      (full list saved to {args.db}.spread_unmatched_fno; symbols "
-            "with a suggested match are likely renames.)"
+        # Print in compact rows for readability.
+        for i in range(0, len(missing), 6):
+            print("        " + "  ".join(missing[i : i + 6]))
+        db["spread_unmatched_fno"].insert_many(
+            [{"symbol": s, "reason": "not_in_source"} for s in missing]
         )
+        print(f"      (full list saved to {args.db}.spread_unmatched_fno)")
+    else:
+        print(f"      all {len(fno_symbols)} current F&O symbols are available in {args.source}.")
     print()
 
     # --- Stage 1: daily spread series -------------------------------------
