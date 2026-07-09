@@ -56,21 +56,27 @@ def years_ago(n_years: int) -> datetime:
 
 
 def to_number(val):
-    """Coerce a possibly-comma-formatted / string value to float, else None."""
+    """Coerce a possibly-comma-formatted / string value to float, else None.
+
+    Treats NaN (pandas' empty-cell value) and blanks as None so downstream
+    int()/division never sees a NaN.
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
         try:
-            return float(val)
+            f = float(val)
         except (TypeError, ValueError):
             return None
+        return None if f != f else f  # f != f is True only for NaN
     s = str(val).strip().replace(",", "")
-    if s in ("", "-", "NA", "na", "nan", "None"):
+    if s in ("", "-", "NA", "na", "nan", "NaN", "None"):
         return None
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return None
+    return None if f != f else f
 
 
 def to_date(val):
