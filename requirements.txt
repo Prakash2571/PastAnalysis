@@ -1,1 +1,6 @@
+# Core analysis (calendar_spread_analysis.py)
 pymongo>=4.6
+
+# Backfilling missing F&O symbols from NSE (ingest_missing_fno.py)
+# Note: nselib pulls in pandas and requires Python 3.10+
+nselib>=2.5
