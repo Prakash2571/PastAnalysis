@@ -214,16 +214,27 @@ def build_daily_pipeline(cutoff: datetime, instrument: str, daily_coll: str, sym
     ]
 
 
-def build_summary_pipeline(summary_coll: str):
+def build_summary_pipeline(summary_coll: str, gap_threshold_days: int):
     """
     Aggregation over the daily spread collection to produce per-symbol stats,
-    including the mean deviation, written to `summary_coll` via $out.
+    including the mean deviation and GAP DETECTION, written to `summary_coll`
+    via $out.
+
+    Gap detection surfaces stocks that were in F&O, dropped out, and later
+    rejoined: the daily series has no documents while the stock is out of F&O,
+    so consecutive trading dates are far apart. Any gap larger than
+    `gap_threshold_days` calendar days (normal weekend/holiday breaks are only
+    a few days) is flagged.
     """
+    ms_per_day = 86400000
     return [
+        # Sort so the pushed arrays below are in chronological order.
+        {"$sort": {"symbol": ASCENDING, "trading_date": ASCENDING}},
         {
             "$group": {
                 "_id": "$symbol",
                 "spreads": {"$push": "$spread"},
+                "dates": {"$push": "$trading_date"},
                 "mean_spread": {"$avg": "$spread"},
                 "max_spread": {"$max": "$spread"},
                 "min_spread": {"$min": "$spread"},
@@ -253,6 +264,86 @@ def build_summary_pipeline(summary_coll: str):
                         }
                     }
                 },
+                # Gaps (in calendar days) between each pair of consecutive
+                # trading dates. date_gaps[k] = dates[k+1] - dates[k].
+                "date_gaps": {
+                    "$map": {
+                        "input": {"$range": [1, {"$size": "$dates"}]},
+                        "as": "i",
+                        "in": {
+                            "$divide": [
+                                {
+                                    "$subtract": [
+                                        {"$arrayElemAt": ["$dates", "$$i"]},
+                                        {
+                                            "$arrayElemAt": [
+                                                "$dates",
+                                                {"$subtract": ["$$i", 1]},
+                                            ]
+                                        },
+                                    ]
+                                },
+                                ms_per_day,
+                            ]
+                        },
+                    }
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "calendar_days_span": {
+                    "$round": [
+                        {
+                            "$divide": [
+                                {"$subtract": ["$last_date", "$first_date"]},
+                                ms_per_day,
+                            ]
+                        },
+                        0,
+                    ]
+                },
+                "largest_gap_days": {"$ifNull": [{"$round": [{"$max": "$date_gaps"}, 0]}, 0]},
+                # Number of gaps longer than the threshold.
+                "gap_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$date_gaps",
+                            "as": "g",
+                            "cond": {"$gt": ["$$g", gap_threshold_days]},
+                        }
+                    }
+                },
+                # Index (into date_gaps) of the single largest gap, or -1.
+                "_max_gap_idx": {
+                    "$indexOfArray": ["$date_gaps", {"$max": "$date_gaps"}]
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "has_gap": {"$gt": ["$gap_count", 0]},
+                # The last trading date before the largest gap ...
+                "largest_gap_start": {
+                    "$cond": [
+                        {"$gte": ["$_max_gap_idx", 0]},
+                        {"$arrayElemAt": ["$dates", "$_max_gap_idx"]},
+                        None,
+                    ]
+                },
+                # ... and the first trading date after it (when it resumed).
+                "largest_gap_end": {
+                    "$cond": [
+                        {"$gte": ["$_max_gap_idx", 0]},
+                        {
+                            "$arrayElemAt": [
+                                "$dates",
+                                {"$add": ["$_max_gap_idx", 1]},
+                            ]
+                        },
+                        None,
+                    ]
+                },
             }
         },
         {
@@ -262,11 +353,18 @@ def build_summary_pipeline(summary_coll: str):
                 "observations": 1,
                 "first_date": 1,
                 "last_date": 1,
+                "calendar_days_span": 1,
                 "mean_spread": {"$round": ["$mean_spread", 4]},
                 "max_spread": {"$round": ["$max_spread", 4]},
                 "min_spread": {"$round": ["$min_spread", 4]},
                 "max_abs_spread": {"$round": ["$max_abs_spread", 4]},
                 "mean_deviation": {"$round": ["$mean_deviation", 4]},
+                # Gap-detection fields.
+                "has_gap": 1,
+                "gap_count": 1,
+                "largest_gap_days": 1,
+                "largest_gap_start": 1,
+                "largest_gap_end": 1,
             }
         },
         {"$sort": {"symbol": ASCENDING}},
@@ -318,6 +416,16 @@ def main():
             "(NSE with DB fallback). Default: auto."
         ),
     )
+    parser.add_argument(
+        "--gap-threshold-days",
+        type=int,
+        default=10,
+        help=(
+            "A break longer than this many calendar days between consecutive "
+            "trading dates is treated as a gap (e.g. left and rejoined F&O). "
+            "Normal weekend/holiday breaks are only a few days. Default: 10."
+        ),
+    )
     args = parser.parse_args()
 
     cutoff = datetime(1970, 1, 1) if args.all_history else years_ago(args.years)
@@ -362,7 +470,7 @@ def main():
     # --- Stage 2: per-symbol summary --------------------------------------
     print(f"[2/4] Building per-symbol summary -> {args.db}.{args.summary_collection} ...")
     db[args.daily_collection].aggregate(
-        build_summary_pipeline(args.summary_collection),
+        build_summary_pipeline(args.summary_collection, args.gap_threshold_days),
         allowDiskUse=True,
     )
     db[args.summary_collection].create_index([("symbol", ASCENDING)], unique=True)
@@ -388,6 +496,43 @@ def main():
             f"{doc['min_spread']:>12.2f}"
             f"{doc['mean_deviation']:>12.2f}"
         )
+
+    # --- Stage 4: gap report ----------------------------------------------
+    gapped = list(
+        db[args.summary_collection]
+        .find({"has_gap": True}, {"_id": 0})
+        .sort("largest_gap_days", -1)
+    )
+    print(
+        f"\n[4/4] Symbols with data gaps > {args.gap_threshold_days} days "
+        f"(likely left & rejoined F&O): {len(gapped)}"
+    )
+    if gapped:
+        header = (
+            f"{'SYMBOL':<14}{'GAPS':>5}{'MAX_GAP_DAYS':>14}"
+            f"{'GAP_FROM':>13}{'GAP_TO':>13}{'OBS':>7}"
+        )
+        print(header)
+        print("-" * len(header))
+
+        def _d(val):
+            return val.date().isoformat() if hasattr(val, "date") else str(val)
+
+        for doc in gapped:
+            print(
+                f"{doc['symbol']:<14}"
+                f"{doc['gap_count']:>5}"
+                f"{int(doc['largest_gap_days']):>14}"
+                f"{_d(doc.get('largest_gap_start')):>13}"
+                f"{_d(doc.get('largest_gap_end')):>13}"
+                f"{doc['observations']:>7}"
+            )
+        print(
+            "\nTip: for these symbols the pre-gap and post-gap data are merged "
+            "in the stats. Review them if you need a continuous series."
+        )
+    else:
+        print("      None. Every current F&O symbol has a continuous history.")
 
     print("\nAll results stored in MongoDB. Done.")
     client.close()
