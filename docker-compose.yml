@@ -28,9 +28,10 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       MONGODB_URI: "mongodb://mongo:27017"
       MONGO_DB: "past_data"
       MONGO_COLLECTION: "hourly_futures"
-      REQUEST_DELAY: "3.0"
     restart: "no"
