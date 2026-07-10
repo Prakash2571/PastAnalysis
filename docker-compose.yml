@@ -1,0 +1,36 @@
+# Hourly Futures Data Backfill — self-contained Docker Compose
+#
+#   docker compose build
+#   docker compose up -d mongo
+#   docker compose run --rm backfill     # runs the full backfill
+#   ./export_data.sh                     # dump to portable archive
+#
+# MongoDB data persists in ./data/mongo on the host.
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: hourly-mongo
+    restart: unless-stopped
+    volumes:
+      - ./data/mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  backfill:
+    build: .
+    image: hourly-futures-backfill:latest
+    container_name: hourly-backfill
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGODB_URI: "mongodb://mongo:27017"
+      MONGO_DB: "past_data"
+      MONGO_COLLECTION: "hourly_futures"
+      REQUEST_DELAY: "3.0"
+    restart: "no"
