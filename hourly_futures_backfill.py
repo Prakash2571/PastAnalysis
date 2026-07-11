@@ -134,10 +134,13 @@ class KiteFetcher:
         return sym_instruments
 
     def fetch_historical_hourly(
-        self, instrument_token: int, from_date: date, to_date: date
+        self, instrument_token: int, from_date: date, to_date: date,
+        continuous: bool = True
     ) -> list[dict]:
         """
         Fetch hourly candles for an instrument between dates.
+        Uses continuous=True to get the full 10-year stitched history
+        (rolls across all past expiry contracts seamlessly).
         Handles Kite's per-request day limit by chunking.
         Returns list of candle dicts.
         """
@@ -152,7 +155,7 @@ class KiteFetcher:
                     from_date=current,
                     to_date=chunk_end,
                     interval="60minute",
-                    continuous=False,
+                    continuous=continuous,
                     oi=True,
                 )
                 all_candles.extend(data)
@@ -308,13 +311,14 @@ def run(args):
     total_fetched = 0
     total_candles = 0
 
-    # For each symbol, get its current active futures instruments
-    # and also fetch historical using continuous=False to get individual contracts
-    # Strategy: use the 3 contract labels (current/mid/far) as separate tasks
+    # For each symbol, fetch continuous historical data for all 3 contract types.
+    # Kite's continuous=True stitches all past expiry contracts into one seamless
+    # 10-year history. We use the NEAREST expiry instrument token for each type
+    # (current=1st, mid=2nd, far=3rd sorted by expiry).
     total_tasks = len(symbols) * 3  # 3 contracts per symbol
     task_num = 0
 
-    log.info("Backfilling hourly futures: %d stocks × 3 contracts = %d tasks",
+    log.info("Backfilling hourly futures (CONTINUOUS mode): %d stocks × 3 contracts = %d tasks",
              len(symbols), total_tasks)
     log.info("Date range: %s -> %s (%d years)", start_date, end_date, years_back)
 
@@ -337,12 +341,9 @@ def run(args):
                 total_skipped += 1
                 continue
 
-            # For historical data of individual expiry contracts, we need to
-            # use the specific instrument token. But for a full 10-year history,
-            # we use the CONTINUOUS contract approach.
-            # Kite's continuous=True stitches all expiry contracts together.
             if idx < len(instruments):
-                # Use the specific active contract for recent data
+                # Use the instrument token for this contract position
+                # With continuous=True, Kite returns the FULL stitched history
                 instr = instruments[idx]
                 token = instr["instrument_token"]
                 expiry = instr["expiry"]
@@ -353,15 +354,17 @@ def run(args):
                 store.mark_done(symbol, contract_type, 0)
                 continue
 
-            log.info("[%d/%d] Fetching %s %s (expiry: %s, token: %s) ...",
-                     task_num, total_tasks, symbol, contract_type, expiry, token)
+            log.info("[%d/%d] Fetching %s %s (continuous, token: %s) ...",
+                     task_num, total_tasks, symbol, contract_type, token)
 
             # Check if we can do incremental update
             last_ts = store.get_last_timestamp(symbol, contract_type)
             fetch_from = last_ts.date() if last_ts else start_date
 
-            # Fetch hourly candles
-            raw_candles = fetcher.fetch_historical_hourly(token, fetch_from, end_date)
+            # Fetch hourly candles with continuous=True for full 10yr history
+            raw_candles = fetcher.fetch_historical_hourly(
+                token, fetch_from, end_date, continuous=True
+            )
 
             if raw_candles:
                 # Normalize into our schema — keep only market-hours candles
