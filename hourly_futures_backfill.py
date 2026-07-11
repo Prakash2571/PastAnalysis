@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Hourly Futures Data Backfill (Zerodha Kite Connect)
+Hybrid Futures Data Backfill (Zerodha Kite Connect)
 ====================================================
 
-Downloads hourly (60-minute) closing candles for all F&O stocks — current month,
-mid month, and far month futures — for the past 10 years and stores them in
-local MongoDB (database: past_data, collection: hourly_futures).
+For every F&O stock, downloads TWO things into local MongoDB (past_data):
 
-Data source: Zerodha Kite Connect API (paid subscription, gives full 10yr history).
+  1. DAILY continuous history (10 years) — the front-month rolled series,
+     using Kite's continuous=True with interval="day". This is the long-term
+     dataset (Kite does NOT support continuous intraday, so daily is the only
+     way to get a full 10-year stitched series).
+
+  2. HOURLY candles for the 3 active contracts (current / mid / far month) —
+     each contract's ~3-month life, market-hours only (9:15-3:30 IST), using
+     continuous=False with interval="60minute". This is the recent detailed
+     dataset.
+
+Both are stored in the same collection, distinguished by a `timeframe` field
+("day" or "hour").
 
 Features:
-  - Fetches ALL 3 monthly contracts (current, mid, far) for every F&O stock
-  - 10 years of hourly candle data per instrument
-  - Serial + polite: respects Kite's rate limits (3 req/sec max, we do ~1/sec)
-  - Resumable: progress tracked per symbol+expiry; re-run picks up where it left off
+  - Serial + rate-limited (respects Kite's ~3 req/sec limit)
+  - Resumable: progress tracked per symbol+contract+timeframe
   - Auto-detects current F&O stock list from Kite instruments API
-  - Checks for missing/new stocks and fetches them too
-  - Includes Open Interest data
-  - Dockerized for easy deployment
-
-Setup:
-  1. Get your api_key and api_secret from https://developers.kite.trade
-  2. Generate access_token daily (see generate_token.py helper)
-  3. Put credentials in .env file
+  - Includes Open Interest in every candle
 
 Usage:
   pip install -r requirements.txt
-  python generate_token.py             # one-time daily: get access_token
+  python generate_token.py                             # daily: get access_token
   python hourly_futures_backfill.py                    # full backfill
   python hourly_futures_backfill.py --symbol RELIANCE  # one stock only
   python hourly_futures_backfill.py --dry-run          # fetch + print, no DB
@@ -40,14 +40,14 @@ import os
 import sys
 import time
 from datetime import datetime, date, timedelta
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
-from pymongo import MongoClient, ReplaceOne, ASCENDING
+from pymongo import MongoClient, ReplaceOne
 from pymongo.errors import BulkWriteError
 
-log = logging.getLogger("hourly_futures")
+log = logging.getLogger("futures_backfill")
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -58,21 +58,24 @@ DB_NAME = os.getenv("MONGO_DB", "past_data")
 COLLECTION = os.getenv("MONGO_COLLECTION", "hourly_futures")
 PROGRESS_COLLECTION = "backfill_progress"
 
-# Kite historical API allows max 400 days per request for intraday candles (60min)
-# So for 10 years we chunk into 60-day segments (to be safe)
-CHUNK_DAYS = 60
+# Kite per-request limits: intraday 60min ~ 400 days, daily ~ 2000 days.
+CHUNK_DAYS_INTRADAY = 60
+CHUNK_DAYS_DAILY = 1800
 
-# Valid market-hours candle start times (IST):
-#   9:15, 10:15, 11:15, 12:15, 13:15, 14:15, 15:15
-# Kite returns candles with timestamps at the OPEN of the candle period.
-# So valid hours are 9, 10, 11, 12, 13, 14, 15.
+# Valid market-hours candle start times (IST): 9,10,11,12,13,14,15
 VALID_MARKET_HOURS = {9, 10, 11, 12, 13, 14, 15}
 
-# Contract labels
+# Active contract positions (sorted by expiry)
 CONTRACT_LABELS = {
     0: "current_month",
     1: "mid_month",
     2: "far_month",
+}
+
+# Index symbols to exclude (we want stock futures only)
+INDEX_SYMBOLS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX",
+    "BANKEX", "NIFTYNXT50",
 }
 
 
@@ -89,110 +92,109 @@ class KiteFetcher:
         self.delay = delay
         self._instruments_cache = None
 
+
     def get_fno_futures_instruments(self) -> list[dict]:
         """Get all NFO futures instruments (FUT type only, not options)."""
         if self._instruments_cache is None:
             log.info("Fetching NFO instruments list from Kite...")
             all_nfo = self.kite.instruments("NFO")
-            # Filter: only futures (not options), only equity (not index)
             self._instruments_cache = [
                 i for i in all_nfo
                 if i["instrument_type"] == "FUT"
                 and i["segment"] == "NFO-FUT"
-                and i["name"] != ""  # skip if no underlying name
+                and i["name"] != ""
             ]
             log.info("Found %d NFO-FUT instruments", len(self._instruments_cache))
         return self._instruments_cache
 
     def get_current_fno_symbols(self) -> list[str]:
-        """Get distinct stock symbols that currently have futures listed."""
+        """Distinct stock symbols that currently have futures (excludes indices)."""
         instruments = self.get_fno_futures_instruments()
-        # Filter only stock futures (exclude index futures like NIFTY, BANKNIFTY)
-        # Index futures have lot_size typically > 15 and symbol in known index list
-        INDEX_SYMBOLS = {
-            "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX",
-            "BANKEX", "NIFTYNXT50",
-        }
-        stock_symbols = sorted(set(
-            i["name"] for i in instruments
-            if i["name"] not in INDEX_SYMBOLS
+        return sorted(set(
+            i["name"] for i in instruments if i["name"] not in INDEX_SYMBOLS
         ))
-        return stock_symbols
 
     def get_instruments_for_symbol(self, symbol: str) -> list[dict]:
-        """
-        Get all active futures instruments for a symbol, sorted by expiry.
-        Returns list of instruments (typically 3: current, mid, far month).
-        """
+        """All active futures instruments for a symbol, sorted by expiry."""
         instruments = self.get_fno_futures_instruments()
-        sym_instruments = [
-            i for i in instruments
-            if i["name"] == symbol
-        ]
-        # Sort by expiry date
-        sym_instruments.sort(key=lambda x: x["expiry"])
-        return sym_instruments
+        sym = [i for i in instruments if i["name"] == symbol]
+        sym.sort(key=lambda x: x["expiry"])
+        return sym
 
-    def fetch_historical_hourly(
-        self, instrument_token: int, from_date: date, to_date: date,
-        continuous: bool = False
-    ) -> list[dict]:
-        """
-        Fetch hourly candles for an instrument between dates.
-
-        NOTE: Kite does NOT support continuous=True for intraday intervals.
-        For intraday, continuous must be False. We fetch using the current
-        instrument token — Kite returns data for the period that token was active.
-
-        To get full history, the orchestrator should call this for each contract
-        with its actual trading date range.
-
-        Handles Kite's per-request day limit by chunking into 60-day segments.
-        Returns list of candle dicts.
-        """
+    def fetch_candles(self, token, from_date, to_date, interval,
+                      continuous, chunk_days) -> list[dict]:
+        """Generic chunked historical fetch. Returns list of candle dicts."""
         all_candles = []
         current = from_date
-
         while current < to_date:
-            chunk_end = min(current + timedelta(days=CHUNK_DAYS), to_date)
+            chunk_end = min(current + timedelta(days=chunk_days), to_date)
             try:
                 data = self.kite.historical_data(
-                    instrument_token=instrument_token,
+                    instrument_token=token,
                     from_date=current,
                     to_date=chunk_end,
-                    interval="60minute",
-                    continuous=False,
+                    interval=interval,
+                    continuous=continuous,
                     oi=True,
                 )
                 all_candles.extend(data)
             except Exception as e:
-                err_msg = str(e).lower()
-                if "too many requests" in err_msg or "429" in err_msg:
+                err = str(e).lower()
+                if "too many requests" in err or "429" in err:
                     log.warning("  Rate limited, sleeping 5s...")
                     time.sleep(5)
-                    continue  # retry same chunk
-                elif "no data" in err_msg or "empty" in err_msg or "no historical" in err_msg:
-                    pass  # no data for this period, move on
-                else:
-                    log.error("  Kite API error for token %s (%s to %s): %s",
-                              instrument_token, current, chunk_end, e)
+                    continue
+                elif "no data" in err or "empty" in err or "no historical" in err:
                     pass
-
+                else:
+                    log.error("  Kite error token %s (%s to %s): %s",
+                              token, current, chunk_end, e)
             current = chunk_end + timedelta(days=1)
-            time.sleep(self.delay)  # respect rate limits
-
+            time.sleep(self.delay)
         return all_candles
 
-    def get_all_fut_instruments_for_symbol(self, symbol: str) -> list[dict]:
-        """
-        Get ALL futures instruments for a symbol (active ones from Kite).
-        Kite only returns currently listed contracts, so for the full 10-year
-        history we need a date-range based approach using the current contracts.
 
-        For continuous intraday history, we use Kite's 'day' interval with
-        continuous=True to get the date range, then fetch intraday per-contract.
-        """
-        return self.get_instruments_for_symbol(symbol)
+
+# --------------------------------------------------------------------------- #
+# Normalization
+# --------------------------------------------------------------------------- #
+
+def normalize(raw, symbol, contract_type, timeframe, expiry, market_hours_only):
+    """Convert Kite candles into our MongoDB schema."""
+    docs = []
+    for c in raw:
+        d = c["date"]
+        ts = d if isinstance(d, datetime) else datetime.combine(d, datetime.min.time())
+        # drop tzinfo for consistent storage
+        ts = ts.replace(tzinfo=None)
+
+        if market_hours_only and ts.hour not in VALID_MARKET_HOURS:
+            continue
+
+        exp = expiry
+        if isinstance(exp, date) and not isinstance(exp, datetime):
+            exp = datetime.combine(exp, datetime.min.time())
+
+        doc = {
+            "symbol": symbol,
+            "contract_type": contract_type,
+            "timeframe": timeframe,
+            "expiry": exp,
+            "timestamp": ts,
+            "date": datetime(ts.year, ts.month, ts.day),
+            "open": float(c.get("open", 0)),
+            "high": float(c.get("high", 0)),
+            "low": float(c.get("low", 0)),
+            "close": float(c.get("close", 0)),
+            "volume": int(c.get("volume", 0)),
+            "open_interest": int(c.get("oi", 0)),
+        }
+        if timeframe == "hour":
+            doc["hour"] = ts.hour
+            doc["candle_number"] = sorted(VALID_MARKET_HOURS).index(ts.hour) + 1
+        docs.append(doc)
+    return docs
+
 
 
 # --------------------------------------------------------------------------- #
@@ -213,77 +215,64 @@ class MongoStore:
 
     def _ensure_indexes(self):
         self.col.create_index(
-            [("symbol", 1), ("contract_type", 1), ("timestamp", 1)],
-            unique=True,
-            name="uniq_symbol_contract_time",
+            [("symbol", 1), ("contract_type", 1), ("timeframe", 1), ("timestamp", 1)],
+            unique=True, name="uniq_symbol_contract_tf_time",
         )
-        self.col.create_index([("symbol", 1), ("date", 1)], name="idx_symbol_date")
+        self.col.create_index([("symbol", 1), ("timeframe", 1), ("date", 1)],
+                              name="idx_symbol_tf_date")
         self.col.create_index([("timestamp", 1)], name="idx_timestamp")
-        self.col.create_index([("expiry", 1)], name="idx_expiry")
 
     def get_completed_tasks(self) -> set[str]:
-        """Returns set of 'symbol|contract_type' strings for completed fetches."""
         return {
-            f"{d['symbol']}|{d['contract_type']}"
-            for d in self.progress.find({"status": "done"}, {"symbol": 1, "contract_type": 1})
+            f"{d['symbol']}|{d['contract_type']}|{d['timeframe']}"
+            for d in self.progress.find(
+                {"status": "done"},
+                {"symbol": 1, "contract_type": 1, "timeframe": 1})
         }
 
-    def get_last_timestamp(self, symbol: str, contract_type: str) -> datetime | None:
-        """Get the most recent candle timestamp for a symbol+contract for incremental updates."""
+    def get_last_timestamp(self, symbol, contract_type, timeframe):
         doc = self.col.find_one(
-            {"symbol": symbol, "contract_type": contract_type},
-            sort=[("timestamp", -1)],
-            projection={"timestamp": 1}
-        )
+            {"symbol": symbol, "contract_type": contract_type, "timeframe": timeframe},
+            sort=[("timestamp", -1)], projection={"timestamp": 1})
         return doc["timestamp"] if doc else None
+
 
     def store_candles(self, candles: list[dict]) -> int:
         if not candles or self.dry_run:
             return len(candles)
         ops = [
             ReplaceOne(
-                {
-                    "symbol": c["symbol"],
-                    "contract_type": c["contract_type"],
-                    "timestamp": c["timestamp"],
-                },
-                c,
-                upsert=True,
-            )
+                {"symbol": c["symbol"], "contract_type": c["contract_type"],
+                 "timeframe": c["timeframe"], "timestamp": c["timestamp"]},
+                c, upsert=True)
             for c in candles
         ]
-        # Batch in groups of 1000 to avoid huge memory usage
         total = 0
         for i in range(0, len(ops), 1000):
             batch = ops[i:i+1000]
             try:
                 self.col.bulk_write(batch, ordered=False)
             except BulkWriteError as bwe:
-                non_dupes = [e for e in bwe.details.get("writeErrors", [])
-                             if e.get("code") != 11000]
-                if non_dupes:
+                nd = [e for e in bwe.details.get("writeErrors", [])
+                      if e.get("code") != 11000]
+                if nd:
                     raise
             total += len(batch)
         return total
 
-    def mark_done(self, symbol: str, contract_type: str, candle_count: int):
+    def mark_done(self, symbol, contract_type, timeframe, n):
         if self.dry_run:
             return
         self.progress.replace_one(
-            {"symbol": symbol, "contract_type": contract_type},
-            {
-                "symbol": symbol,
-                "contract_type": contract_type,
-                "status": "done",
-                "candle_count": candle_count,
-                "completed_at": datetime.utcnow(),
-            },
-            upsert=True,
-        )
+            {"symbol": symbol, "contract_type": contract_type, "timeframe": timeframe},
+            {"symbol": symbol, "contract_type": contract_type, "timeframe": timeframe,
+             "status": "done", "candle_count": n, "completed_at": datetime.now()},
+            upsert=True)
 
     def close(self):
         if not self.dry_run:
             self.client.close()
+
 
 
 # --------------------------------------------------------------------------- #
@@ -292,8 +281,6 @@ class MongoStore:
 
 def run(args):
     load_dotenv()
-
-    # Kite credentials
     api_key = os.getenv("KITE_API_KEY")
     access_token = os.getenv("KITE_ACCESS_TOKEN")
     if not api_key or not access_token:
@@ -310,127 +297,81 @@ def run(args):
     store = MongoStore(uri, db_name, dry_run=args.dry_run)
     fetcher = KiteFetcher(api_key, access_token, delay=delay)
 
-    # Date range
     end_date = date.today()
     start_date = end_date - timedelta(days=years_back * 365)
 
-    # Get symbols
     if args.symbol:
         symbols = [args.symbol.upper()]
     else:
         symbols = fetcher.get_current_fno_symbols()
         log.info("Found %d F&O stock symbols", len(symbols))
 
-    # Check which are already done (resume)
     completed = store.get_completed_tasks() if not args.dry_run else set()
-    total_skipped = 0
-    total_fetched = 0
-    total_candles = 0
-
-    # For each symbol, fetch hourly data for all 3 contract positions.
-    # Kite does NOT support continuous=True for intraday intervals.
-    # However, Kite DOES return the full available history for a given token
-    # when continuous=False — it just returns data for the dates that specific
-    # contract existed. Since Kite only lists currently active contracts,
-    # we get ~3 months per contract (its active life).
-    #
-    # For the FULL 10-year hourly history, we use Kite's daily continuous data
-    # to get the price history, then also fetch hourly for the active contracts.
-    # This gives us: 10yr daily + recent months hourly for all 3 contracts.
-    #
-    # UPDATE: Actually, the correct Kite approach for full intraday history is
-    # to fetch with the current token and the full date range — Kite returns
-    # data from when that UNDERLYING first had futures listed, not just the
-    # current contract's life. Let's try the full range and see what comes back.
-    total_tasks = len(symbols) * 3  # 3 contracts per symbol
+    total_skipped = total_fetched = total_candles = 0
+    total_tasks = len(symbols) * 4  # 1 daily + 3 hourly per symbol
     task_num = 0
 
-    log.info("Backfilling hourly futures: %d stocks × 3 contracts = %d tasks",
+    log.info("HYBRID backfill: %d stocks x (1 daily 10yr + 3 hourly) = %d tasks",
              len(symbols), total_tasks)
     log.info("Date range: %s -> %s (%d years)", start_date, end_date, years_back)
 
+
     for symbol in symbols:
-        # Get active instruments for this symbol
         instruments = fetcher.get_instruments_for_symbol(symbol)
-
         if not instruments:
-            log.warning("  %s: no futures instruments found, skipping", symbol)
-            task_num += 3
+            log.warning("  %s: no futures instruments, skipping", symbol)
+            task_num += 4
             continue
+        front_token = instruments[0]["instrument_token"]
 
-        # Process each contract (current, mid, far)
+        # ---- Task 1: DAILY continuous, full 10 years ----
+        task_num += 1
+        if f"{symbol}|continuous|day" in completed:
+            total_skipped += 1
+        else:
+            log.info("[%d/%d] %s DAILY continuous (10yr) ...", task_num, total_tasks, symbol)
+            last_ts = store.get_last_timestamp(symbol, "continuous", "day")
+            frm = last_ts.date() if last_ts else start_date
+            raw = fetcher.fetch_candles(front_token, frm, end_date, "day", True, CHUNK_DAYS_DAILY)
+            docs = normalize(raw, symbol, "continuous", "day", None, market_hours_only=False)
+            n = store.store_candles(docs)
+            store.mark_done(symbol, "continuous", "day", n)
+            total_candles += n
+            total_fetched += 1
+            if docs:
+                log.info("  -> %d daily candles (%s to %s)", n,
+                         docs[0]["date"].date(), docs[-1]["date"].date())
+            else:
+                log.warning("  -> 0 daily candles")
+            time.sleep(delay)
+
+        # ---- Tasks 2-4: HOURLY per contract (current / mid / far) ----
         for idx, contract_type in CONTRACT_LABELS.items():
             task_num += 1
-            task_key = f"{symbol}|{contract_type}"
-
-            # Skip if already completed
-            if task_key in completed:
+            if f"{symbol}|{contract_type}|hour" in completed:
                 total_skipped += 1
                 continue
-
-            if idx < len(instruments):
-                instr = instruments[idx]
-                token = instr["instrument_token"]
-                expiry = instr["expiry"]
-            else:
-                log.info("[%d/%d] %s %s: no contract available (< 3 expiries)",
-                         task_num, total_tasks, symbol, contract_type)
-                store.mark_done(symbol, contract_type, 0)
+            if idx >= len(instruments):
+                store.mark_done(symbol, contract_type, "hour", 0)
                 continue
-
-            log.info("[%d/%d] Fetching %s %s (token: %s, expiry: %s) ...",
-                     task_num, total_tasks, symbol, contract_type, token, expiry)
-
-            # Check if we can do incremental update
-            last_ts = store.get_last_timestamp(symbol, contract_type)
-            fetch_from = last_ts.date() if last_ts else start_date
-
-            # Fetch hourly candles (continuous=False, full date range)
-            raw_candles = fetcher.fetch_historical_hourly(
-                token, fetch_from, end_date, continuous=False
-            )
-
-            if raw_candles:
-                # Normalize into our schema — keep only market-hours candles
-                docs = []
-                for c in raw_candles:
-                    ts = c["date"] if isinstance(c["date"], datetime) else datetime.combine(c["date"], datetime.min.time())
-
-                    # Filter: only keep candles within market hours (9:15-3:30 IST)
-                    # Kite returns IST timestamps; valid candle hours are 9-15
-                    if ts.hour not in VALID_MARKET_HOURS:
-                        continue
-
-                    docs.append({
-                        "symbol": symbol,
-                        "contract_type": contract_type,
-                        "expiry": datetime.combine(expiry, datetime.min.time()) if isinstance(expiry, date) else expiry,
-                        "timestamp": ts,
-                        "date": datetime(ts.year, ts.month, ts.day),
-                        "hour": ts.hour,
-                        "candle_number": sorted(VALID_MARKET_HOURS).index(ts.hour) + 1,
-                        "open": float(c.get("open", 0)),
-                        "high": float(c.get("high", 0)),
-                        "low": float(c.get("low", 0)),
-                        "close": float(c.get("close", 0)),
-                        "volume": int(c.get("volume", 0)),
-                        "open_interest": int(c.get("oi", 0)),
-                    })
-
-                n = store.store_candles(docs)
-                store.mark_done(symbol, contract_type, n)
-                total_candles += n
-                total_fetched += 1
-
-                first_dt = docs[0]["timestamp"].date() if docs else None
-                last_dt = docs[-1]["timestamp"].date() if docs else None
-                log.info("  -> %d candles stored (%s to %s)", n, first_dt, last_dt)
+            instr = instruments[idx]
+            token = instr["instrument_token"]
+            expiry = instr["expiry"]
+            log.info("[%d/%d] %s %s HOURLY (expiry %s) ...",
+                     task_num, total_tasks, symbol, contract_type, expiry)
+            last_ts = store.get_last_timestamp(symbol, contract_type, "hour")
+            frm = last_ts.date() if last_ts else start_date
+            raw = fetcher.fetch_candles(token, frm, end_date, "60minute", False, CHUNK_DAYS_INTRADAY)
+            docs = normalize(raw, symbol, contract_type, "hour", expiry, market_hours_only=True)
+            n = store.store_candles(docs)
+            store.mark_done(symbol, contract_type, "hour", n)
+            total_candles += n
+            total_fetched += 1
+            if docs:
+                log.info("  -> %d hourly candles (%s to %s)", n,
+                         docs[0]["date"].date(), docs[-1]["date"].date())
             else:
-                store.mark_done(symbol, contract_type, 0)
-                total_fetched += 1
-                log.warning("  -> 0 candles (no data for this contract)")
-
-            # Rate limit pause
+                log.warning("  -> 0 hourly candles")
             time.sleep(delay)
 
     log.info("Done. fetched=%d skipped=%d total_candles=%d",
@@ -438,9 +379,10 @@ def run(args):
     store.close()
 
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Backfill hourly futures candles from Kite Connect into MongoDB"
+        description="Hybrid futures backfill (10yr daily + hourly) from Kite into MongoDB"
     )
     parser.add_argument("--symbol", help="Process only this symbol (e.g. RELIANCE)")
     parser.add_argument("--dry-run", action="store_true",
