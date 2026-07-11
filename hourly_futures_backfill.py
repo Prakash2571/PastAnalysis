@@ -62,6 +62,12 @@ PROGRESS_COLLECTION = "backfill_progress"
 # So for 10 years we chunk into 60-day segments (to be safe)
 CHUNK_DAYS = 60
 
+# Valid market-hours candle start times (IST):
+#   9:15, 10:15, 11:15, 12:15, 13:15, 14:15, 15:15
+# Kite returns candles with timestamps at the OPEN of the candle period.
+# So valid hours are 9, 10, 11, 12, 13, 14, 15.
+VALID_MARKET_HOURS = {9, 10, 11, 12, 13, 14, 15}
+
 # Contract labels
 CONTRACT_LABELS = {
     0: "current_month",
@@ -358,10 +364,16 @@ def run(args):
             raw_candles = fetcher.fetch_historical_hourly(token, fetch_from, end_date)
 
             if raw_candles:
-                # Normalize into our schema
+                # Normalize into our schema — keep only market-hours candles
                 docs = []
                 for c in raw_candles:
                     ts = c["date"] if isinstance(c["date"], datetime) else datetime.combine(c["date"], datetime.min.time())
+
+                    # Filter: only keep candles within market hours (9:15-3:30 IST)
+                    # Kite returns IST timestamps; valid candle hours are 9-15
+                    if ts.hour not in VALID_MARKET_HOURS:
+                        continue
+
                     docs.append({
                         "symbol": symbol,
                         "contract_type": contract_type,
@@ -369,6 +381,7 @@ def run(args):
                         "timestamp": ts,
                         "date": datetime(ts.year, ts.month, ts.day),
                         "hour": ts.hour,
+                        "candle_number": sorted(VALID_MARKET_HOURS).index(ts.hour) + 1,
                         "open": float(c.get("open", 0)),
                         "high": float(c.get("high", 0)),
                         "low": float(c.get("low", 0)),
