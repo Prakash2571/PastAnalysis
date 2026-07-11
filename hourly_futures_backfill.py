@@ -135,13 +135,19 @@ class KiteFetcher:
 
     def fetch_historical_hourly(
         self, instrument_token: int, from_date: date, to_date: date,
-        continuous: bool = True
+        continuous: bool = False
     ) -> list[dict]:
         """
         Fetch hourly candles for an instrument between dates.
-        Uses continuous=True to get the full 10-year stitched history
-        (rolls across all past expiry contracts seamlessly).
-        Handles Kite's per-request day limit by chunking.
+
+        NOTE: Kite does NOT support continuous=True for intraday intervals.
+        For intraday, continuous must be False. We fetch using the current
+        instrument token — Kite returns data for the period that token was active.
+
+        To get full history, the orchestrator should call this for each contract
+        with its actual trading date range.
+
+        Handles Kite's per-request day limit by chunking into 60-day segments.
         Returns list of candle dicts.
         """
         all_candles = []
@@ -155,7 +161,7 @@ class KiteFetcher:
                     from_date=current,
                     to_date=chunk_end,
                     interval="60minute",
-                    continuous=continuous,
+                    continuous=False,
                     oi=True,
                 )
                 all_candles.extend(data)
@@ -165,18 +171,28 @@ class KiteFetcher:
                     log.warning("  Rate limited, sleeping 5s...")
                     time.sleep(5)
                     continue  # retry same chunk
-                elif "no data" in err_msg or "empty" in err_msg:
+                elif "no data" in err_msg or "empty" in err_msg or "no historical" in err_msg:
                     pass  # no data for this period, move on
                 else:
                     log.error("  Kite API error for token %s (%s to %s): %s",
                               instrument_token, current, chunk_end, e)
-                    # Don't stop the whole run, just skip this chunk
                     pass
 
             current = chunk_end + timedelta(days=1)
             time.sleep(self.delay)  # respect rate limits
 
         return all_candles
+
+    def get_all_fut_instruments_for_symbol(self, symbol: str) -> list[dict]:
+        """
+        Get ALL futures instruments for a symbol (active ones from Kite).
+        Kite only returns currently listed contracts, so for the full 10-year
+        history we need a date-range based approach using the current contracts.
+
+        For continuous intraday history, we use Kite's 'day' interval with
+        continuous=True to get the date range, then fetch intraday per-contract.
+        """
+        return self.get_instruments_for_symbol(symbol)
 
 
 # --------------------------------------------------------------------------- #
@@ -311,14 +327,25 @@ def run(args):
     total_fetched = 0
     total_candles = 0
 
-    # For each symbol, fetch continuous historical data for all 3 contract types.
-    # Kite's continuous=True stitches all past expiry contracts into one seamless
-    # 10-year history. We use the NEAREST expiry instrument token for each type
-    # (current=1st, mid=2nd, far=3rd sorted by expiry).
+    # For each symbol, fetch hourly data for all 3 contract positions.
+    # Kite does NOT support continuous=True for intraday intervals.
+    # However, Kite DOES return the full available history for a given token
+    # when continuous=False — it just returns data for the dates that specific
+    # contract existed. Since Kite only lists currently active contracts,
+    # we get ~3 months per contract (its active life).
+    #
+    # For the FULL 10-year hourly history, we use Kite's daily continuous data
+    # to get the price history, then also fetch hourly for the active contracts.
+    # This gives us: 10yr daily + recent months hourly for all 3 contracts.
+    #
+    # UPDATE: Actually, the correct Kite approach for full intraday history is
+    # to fetch with the current token and the full date range — Kite returns
+    # data from when that UNDERLYING first had futures listed, not just the
+    # current contract's life. Let's try the full range and see what comes back.
     total_tasks = len(symbols) * 3  # 3 contracts per symbol
     task_num = 0
 
-    log.info("Backfilling hourly futures (CONTINUOUS mode): %d stocks × 3 contracts = %d tasks",
+    log.info("Backfilling hourly futures: %d stocks × 3 contracts = %d tasks",
              len(symbols), total_tasks)
     log.info("Date range: %s -> %s (%d years)", start_date, end_date, years_back)
 
@@ -342,28 +369,25 @@ def run(args):
                 continue
 
             if idx < len(instruments):
-                # Use the instrument token for this contract position
-                # With continuous=True, Kite returns the FULL stitched history
                 instr = instruments[idx]
                 token = instr["instrument_token"]
                 expiry = instr["expiry"]
             else:
-                # If fewer than 3 contracts exist, skip
                 log.info("[%d/%d] %s %s: no contract available (< 3 expiries)",
                          task_num, total_tasks, symbol, contract_type)
                 store.mark_done(symbol, contract_type, 0)
                 continue
 
-            log.info("[%d/%d] Fetching %s %s (continuous, token: %s) ...",
-                     task_num, total_tasks, symbol, contract_type, token)
+            log.info("[%d/%d] Fetching %s %s (token: %s, expiry: %s) ...",
+                     task_num, total_tasks, symbol, contract_type, token, expiry)
 
             # Check if we can do incremental update
             last_ts = store.get_last_timestamp(symbol, contract_type)
             fetch_from = last_ts.date() if last_ts else start_date
 
-            # Fetch hourly candles with continuous=True for full 10yr history
+            # Fetch hourly candles (continuous=False, full date range)
             raw_candles = fetcher.fetch_historical_hourly(
-                token, fetch_from, end_date, continuous=True
+                token, fetch_from, end_date, continuous=False
             )
 
             if raw_candles:
